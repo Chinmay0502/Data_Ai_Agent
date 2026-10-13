@@ -36,14 +36,34 @@ class ETLTools:
 
             # Support APIs that return a list directly, as well as
             # APIs that wrap records in a "results" property.
-            if isinstance(data, dict) and "results" in data:
-                records = data["results"]
-            elif isinstance(data, list):
-                records = data
-            else:
-                records = data
+            # if isinstance(data, dict) and "results" in data:
+            #     records = data["results"]
+            # elif isinstance(data, list):
+            #     records = data
+            # else:
+            #     records = data
 
-            df = pd.json_normalize(records)
+            # df = pd.json_normalize(records)
+            
+            # Support APIs that return records under common keys,
+            # including DummyJSON's "products" key.
+            if isinstance(data, list):
+                records = data
+            elif isinstance(data, dict):
+                records = None
+
+                for key in ("products", "results", "data", "items", "records"):
+                    if isinstance(data.get(key), list):
+                        records = data[key]
+                        break
+
+                if records is None:
+                    records = [data]
+                else:
+                    return "Failed to extract data: API response must be a JSON object or list."
+
+                df = pd.json_normalize(records)
+
 
             if format == "csv":
                 df.to_csv(filename, index=False)

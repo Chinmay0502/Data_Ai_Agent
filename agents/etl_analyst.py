@@ -65,6 +65,10 @@ def transform_load_tool(
     # ---------------------------------------------------------
     # 1. Resolve the current session's directory
     # ---------------------------------------------------------
+    
+# ---------------------------------------------------------
+# 1. Resolve the current session's directory
+# ---------------------------------------------------------
     try:
         session_id = current_session_id.get()
     except Exception:
@@ -76,12 +80,96 @@ def transform_load_tool(
             "Please start a session before transforming data."
         )
 
-    base_dir = os.path.join("/tmp", "ola_data_agent", str(session_id))
+    # Use the same session-storage helper as the rest of the app.
+    base_dir = str(get_session_folder().resolve())
 
     if not os.path.isdir(base_dir):
+        return f"Error: Session directory does not exist: {base_dir}"
+
+    # ---------------------------------------------------------
+    # 2. Find the input file anywhere inside this session
+    # ---------------------------------------------------------
+    def is_inside_session(path: str) -> bool:
+        try:
+            return os.path.commonpath([
+            os.path.realpath(base_dir),
+            os.path.realpath(path),
+            ]) == os.path.realpath(base_dir)
+        except (ValueError, OSError):
+            return False
+
+    input_path = None
+
+    # First, honor a valid path supplied by the LLM.
+    if input_file_path:
+        candidate = input_file_path.strip().strip('"').strip("'")
+
+    if not os.path.isabs(candidate):
+        candidate = os.path.join(base_dir, candidate)
+
+    candidate = os.path.realpath(candidate)
+
+    if is_inside_session(candidate) and os.path.isfile(candidate):
+        input_path = candidate
+
+    # If the path was missing or invalid, search recursively.
+    # This includes output/, extract/, and nested folders.
+    if input_path is None:
+        preferred_names = (
+            "extracted_data.csv",
+            "extracted_data.json",
+            "extracted_data.parquet",
+        )
+
+        discovered_files = []
+
+        for root, dirs, files in os.walk(base_dir):
+            # Ignore hidden directories.
+            dirs[:] = [d for d in dirs if not d.startswith(".")]
+
+            for filename in files:
+                if filename.lower().endswith(
+                    (".csv", ".json", ".parquet", ".pq")
+                ):
+                    full_path = os.path.realpath(
+                        os.path.join(root, filename)
+                    )
+                    
+                    if is_inside_session(full_path):
+                        discovered_files.append(full_path)
+
+        # Prefer the original extraction over transformed outputs.
+        for preferred_name in preferred_names:
+            matches = sorted(
+                path for path in discovered_files
+                if os.path.basename(path).lower() == preferred_name
+            )
+
+            if matches:
+                input_path = matches[0]
+                break
+
+        # Fall back to another supported file if no canonical
+        # extracted_data file exists.
+        if input_path is None:
+            excluded_names = {
+                "transformed_data.csv",
+                "cleaned_products.csv",
+            }
+
+            fallback_files = [
+                path for path in discovered_files
+                if os.path.basename(path).lower() not in excluded_names
+            ]
+
+            if fallback_files:
+                input_path = sorted(fallback_files)[0]
+
+    if input_path is None:
         return (
-            f"Error: Session directory does not exist: {base_dir}. "
-            "Please run extraction first."
+            "Error: Could not find an extracted CSV, JSON, or Parquet "
+            f"file inside the current session: {base_dir}. "
+            "Run extraction first."
         )
 
     # ---------------------------------------------------------
@@ -448,6 +536,26 @@ def transform_load_tool(
     # ---------------------------------------------------------
     # 7. Validate output format and create output directory
     # ---------------------------------------------------------
+    # Detect an explicitly requested output filename, such as
+    # "save it as cleaned_products.csv".
+    filename_match = re.search(
+        r"\b([A-Za-z0-9][A-Za-z0-9_.-]*\.(?:csv|json|parquet))\b",
+        question if "question" in locals() else (user_question or ""),
+        re.IGNORECASE,
+    )
+
+    requested_output_filename = (
+        os.path.basename(filename_match.group(1))
+        if filename_match
+        else None
+    )
+
+    # If a filename specifies a format, honor its extension.
+    if requested_output_filename:
+        output_format = os.path.splitext(
+        requested_output_filename
+        )[1].lstrip(".").lower()
+
     output_format = (output_format or "csv").lower().strip()
     if output_format.startswith("."):
         output_format = output_format[1:]
@@ -481,10 +589,15 @@ def transform_load_tool(
     except OSError as exc:
         return f"Error creating output directory: {exc}"
 
-    output_path = os.path.join(
-        output_folder,
-        f"transformed_data.{output_format}",
+    
+    output_filename = (
+        requested_output_filename
+        if requested_output_filename
+        else f"transformed_data.{output_format}"
     )
+    
+    output_path = os.path.join(output_folder, output_filename)
+
 
     # ---------------------------------------------------------
     # 8. Save transformed data
