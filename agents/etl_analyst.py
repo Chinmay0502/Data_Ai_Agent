@@ -42,6 +42,7 @@ def extract_load_tool(url:str, output_folder:str, format:str) -> str:
 
 
 
+
 @tool
 def transform_load_tool(
     input_file_path: str,
@@ -53,51 +54,61 @@ def transform_load_tool(
     try:
         session_folder = get_session_folder().resolve()
 
-        # Prefer the path supplied by the agent if it points to a
-        # file inside this session. Otherwise, search this session.
+        # 1. Locate the input file safely within the current session.
         candidate = (input_file_path or "").strip().strip('"')
         input_path = None
 
         if candidate:
-            supplied_path = os.path.abspath(
-                candidate if os.path.isabs(candidate)
-                else session_folder / candidate
+            supplied_path = (
+                os.path.abspath(os.path.join(session_folder, candidate))
+                if not os.path.isabs(candidate)
+                else os.path.abspath(candidate)
             )
+
+            real_path = os.path.realpath(supplied_path)
+            real_session = os.path.realpath(str(session_folder))
 
             try:
-                is_inside_session = (
-                    os.path.commonpath([
-                        str(session_folder),
-                        os.path.realpath(supplied_path),
-                    ]) == os.path.realpath(session_folder)
+                inside_session = (
+                    os.path.commonpath([real_session, real_path])
+                    == real_session
                 )
             except ValueError:
-                is_inside_session = False
+                inside_session = False
 
-            if is_inside_session and os.path.isfile(supplied_path):
-                input_path = supplied_path
+            if inside_session and os.path.isfile(real_path):
+                input_path = real_path
 
-        # If the model omitted the path or supplied an invalid one,
-        # search the current session's extraction directory.
+        # Search both directory layouts used by the extraction tool.
         if input_path is None:
-            preferred = (
-                session_folder / "data" / "extract" / "extracted_data.csv"
+            search_dirs = [
+                session_folder / "extract",
+                session_folder / "data" / "extract",
+            ]
+
+            for directory in search_dirs:
+                preferred = directory / "extracted_data.csv"
+                if preferred.is_file():
+                    input_path = str(preferred.resolve())
+                    break
+
+            # Fall back to another CSV in either extraction folder.
+            if input_path is None:
+                for directory in search_dirs:
+                    if directory.is_dir():
+                        matches = sorted(directory.glob("*.csv"))
+                        if matches:
+                            input_path = str(matches[0].resolve())
+                            break
+
+        if input_path is None:
+            return (
+                "No extracted file was found in the current session. "
+                f"Session folder: {session_folder}. "
+                "Please extract the data in this chat first."
             )
-            if preferred.is_file():
-                input_path = str(preferred)
-            else:
-                matches = sorted(
-                    (session_folder / "data" / "extract").glob("*.csv")
-                ) if (session_folder / "data" / "extract").is_dir() else []
 
-                if matches:
-                    input_path = str(matches[0])
-                else:
-                    return (
-                        "No extracted CSV was found in this session. "
-                        "Please extract data in this chat first."
-                    )
-
+        # 2. Load the source file.
         extension = os.path.splitext(input_path)[1].lower()
 
         if extension == ".csv":
@@ -109,33 +120,46 @@ def transform_load_tool(
         else:
             return f"Unsupported input format: {extension}"
 
-        fmt = output_format.lower().strip()
+        # 3. Validate the output format.
+        fmt = (output_format or "csv").lower().strip()
         if fmt not in {"csv", "json", "parquet"}:
             return f"Unsupported output format: {output_format}"
 
-        # Keep output inside the active session.
-        output_name = f"transformed_data.{fmt}"
-        output_path = get_output_path(
-            os.path.join(output_folder, output_name)
-        )
+        # 4. Apply deterministic transformations when recognized.
+        question = (user_question or "").lower()
 
-        # Handle this requested operation deterministically.
-        question = user_question.lower()
-        if "name" in question and "url" in question:
-            missing = {"name", "url"} - set(df.columns)
+        product_columns = [
+            "id", "title", "category", "price", "rating", "stock"
+        ]
+
+        if (
+            all(col in df.columns for col in product_columns)
+            and all(col in question for col in product_columns)
+        ):
+            df = df[product_columns].copy()
+            df = df.drop_duplicates(subset=["id"])
+            df["title"] = df["title"].astype("string").str.strip()
+            df = df[df["title"].notna() & df["title"].ne("")].copy()
+
+        elif "name" in question and "url" in question:
+            required = {"name", "url"}
+            missing = required - set(df.columns)
+
             if missing:
                 return (
-                    f"Cannot perform transformation: missing columns "
-                    f"{sorted(missing)}. Available columns: {list(df.columns)}"
+                    f"Missing columns: {sorted(missing)}. "
+                    f"Available columns: {list(df.columns)}"
                 )
+
             df = df[["name", "url"]].drop_duplicates()
 
         else:
+            # Keep the existing LLM-based transformation for other tasks.
             llm = pick_llm("medium")
             prompt = f"""
 Transform the existing pandas DataFrame named df as requested.
-Return Python code only. Do not read or write files, import modules,
-or specify output paths. Leave the final DataFrame in variable df.
+Return Python code only. Do not read or write files or import modules.
+Leave the final DataFrame in variable df.
 
 Request: {user_question}
 Columns: {list(df.columns)}
@@ -149,6 +173,7 @@ Preview:
                 return "Error: The model did not return Python code."
 
             pandas_code = pandas_code.strip()
+
             if pandas_code.startswith("```"):
                 lines = pandas_code.splitlines()
                 if lines and lines[0].startswith("```"):
@@ -162,11 +187,23 @@ Preview:
                 "pd": pd,
                 "df": df.copy(),
             }
+
             exec(pandas_code, namespace)
             df = namespace.get("df")
 
             if not isinstance(df, pd.DataFrame):
-                return "Error: Transformation must leave a DataFrame named df."
+                return (
+                    "Error: Transformation must leave a DataFrame "
+                    "named df."
+                )
+
+        # 5. Save output inside this session.
+        output_name = f"transformed_data.{fmt}"
+        relative_output_folder = (output_folder or "transform").strip()
+
+        output_path = get_output_path(
+            os.path.join(relative_output_folder, output_name)
+        )
 
         if fmt == "csv":
             df.to_csv(output_path, index=False)
@@ -175,12 +212,16 @@ Preview:
         else:
             df.to_parquet(output_path, index=False)
 
+        # 6. Return a preview and row count.
+        preview = df.head(5).to_string(index=False)
+
         return (
-            f"Transformation completed successfully.\n"
+            "Transformation completed successfully.\n"
             f"Input file: {input_path}\n"
             f"Output file: {output_path}\n"
             f"Format: {fmt}\n"
-            f"Rows saved: {len(df)}"
+            f"Total rows: {len(df)}\n"
+            f"Preview (first 5 rows):\n{preview}"
         )
 
     except Exception as e:
