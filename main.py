@@ -116,7 +116,14 @@ async def chat(request: ChatRequest):
                 "route_response": "",
             }
 
-            result = await data_agent.ainvoke(initial_state)
+            # result = await data_agent.ainvoke(initial_state)
+            result = await data_agent.ainvoke(initial_state,
+                                              config={
+                                                  "configurable": {
+                                                      "thread_id": session_id
+                                                    }
+                                                },
+                                            )
             answer = extract_answer(result.get("messages", []))
 
             if not answer:
