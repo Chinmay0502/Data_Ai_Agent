@@ -79,20 +79,23 @@ def transform_load_tool(
             if inside_session and os.path.isfile(real_path):
                 input_path = real_path
 
-        # Search both directory layouts used by the extraction tool.
+        # Search common extraction folder names in the current session.
         if input_path is None:
             search_dirs = [
+                session_folder / "extraction",
                 session_folder / "extract",
                 session_folder / "data" / "extract",
+                session_folder / "data" / "extraction",
             ]
 
+            # Prefer the expected filename.
             for directory in search_dirs:
-                preferred = directory / "extracted_data.csv"
-                if preferred.is_file():
-                    input_path = str(preferred.resolve())
+                candidate_path = directory / "extracted_data.csv"
+                if candidate_path.is_file():
+                    input_path = str(candidate_path.resolve())
                     break
 
-            # Fall back to another CSV in either extraction folder.
+            # Otherwise, use the first available CSV.
             if input_path is None:
                 for directory in search_dirs:
                     if directory.is_dir():
@@ -101,12 +104,13 @@ def transform_load_tool(
                             input_path = str(matches[0].resolve())
                             break
 
-        if input_path is None:
-            return (
-                "No extracted file was found in the current session. "
-                f"Session folder: {session_folder}. "
-                "Please extract the data in this chat first."
-            )
+            if input_path is None:
+                return (
+                    "No extracted CSV found in the current session.\n"
+                    f"Session folder searched: {session_folder}\n"
+                    f"Directories checked: {[str(p) for p in search_dirs]}"
+                )
+
 
         # 2. Load the source file.
         extension = os.path.splitext(input_path)[1].lower()
