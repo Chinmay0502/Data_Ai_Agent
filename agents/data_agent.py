@@ -122,11 +122,11 @@ data_agent_graph.add_conditional_edges("router_node", route_edge,
 
 data_agent = data_agent_graph.compile()
 
-# Optional|
-from IPython.display import display, Image
-img = Image(data_agent.get_graph().draw_mermaid_png())
-with open("data_agent_graph.png", "wb") as f:
-    f.write(img.data)
+# # Optional|
+# from IPython.display import display, Image
+# img = Image(data_agent.get_graph().draw_mermaid_png())
+# with open("data_agent_graph.png", "wb") as f:
+#     f.write(img.data)
 
 
 
