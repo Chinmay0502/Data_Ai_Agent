@@ -9,7 +9,7 @@ def pick_llm(Level: str):
     if Level.lower() == "low":
         llm = ChatGroq(model="openai/gpt-oss-120b", temperature=0)
     elif Level.lower() == 'medium':
-        llm = ChatGroq(model="meta-llama/llama-prompt-guard-2-22m", temperature=2)
+        llm = ChatGroq(model="openai/gpt-oss-120b", temperature=2)
     elif Level.lower() == 'high':
         llm = ChatGoogleGenerativeAI(model = 'gemini-3.6-flash', temperature = 0)
     else:
