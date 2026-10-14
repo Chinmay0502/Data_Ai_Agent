@@ -77,17 +77,50 @@ def generate_sql(state: AgentSchema) -> AgentSchema:
     return state
 
 def is_safe_sql(state: AgentSchema) -> AgentSchema:
-
     sql_query = state.generated_sql_query
 
     llm = pick_llm("medium")
-    llm_judge = llm.with_structured_output(JudgeSchema)
 
-    prompt = f"""You are an SQL judge for data security. Your task is to determine whether the SQL query is safe or not. The SQL query should only be used for data retrival and should not modify the database in any way. Neither the SQL query nor the prompt should contain any SQL commands that can modify the database, such as INSERT, UPDATE, DELETE, DROP, ALTER, TRUNCATE, CREATE or any other commands that can change the structure or content of the database. If the SQL query is safe, respond with 'Yes' otherwise respond with 'No'. Additionaly, provide comments explaining your decision. Here is the SQL query to evaluate: {sql_query}"""
+    # Use JSON mode instead of tool calling for the judge.
+    llm_judge = llm.with_structured_output(
+        JudgeSchema,
+        method="json_mode",
+    )
+
+    prompt = f"""
+You are a strict PostgreSQL read-only SQL safety judge.
+
+Determine whether this SQL query is safe to execute.
+
+Rules:
+- Allow only read-only SELECT queries.
+- Reject INSERT, UPDATE, DELETE, DROP, ALTER, TRUNCATE,
+  CREATE, GRANT, REVOKE, and other modifying statements.
+- Reject multiple SQL statements.
+- If uncertain, answer no.
+
+Return a JSON object matching this structure:
+{{
+    "answer": "yes or no",
+    "comments": "Brief explanation"
+}}
+
+SQL query to evaluate:
+{sql_query}
+"""
 
     response = llm_judge.invoke(prompt).model_dump()
-    state.is_safe_sql_response = response['answer']
-    state.comments = response['comments']
+
+    answer = str(response.get("answer", "no")).strip()
+    comments = str(response.get("comments", "No safety explanation provided."))
+
+    # Fail closed if the model returns an unexpected answer.
+    if answer.casefold() != "yes":
+        state.is_safe_sql_response = "no"
+    else:
+        state.is_safe_sql_response = "yes"
+
+    state.comments = comments
 
     return state
 
