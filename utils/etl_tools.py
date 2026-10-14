@@ -1,99 +1,149 @@
-
 import os
-import requests
-import pandas as pd
+import shutil
+import tempfile
+import time
+from pathlib import Path
 
-from utils.session_storage import get_output_path, get_session_folder
+import pandas as pd
+import requests
+
+
+# Shared temporary workspace for the portfolio demo.
+DATA_ROOT = Path(tempfile.gettempdir()) / "ola_data_agent"
+EXTRACT_DIR = DATA_ROOT / "extract"
+TRANSFORM_DIR = DATA_ROOT / "transform"
+
+EXTRACT_DIR.mkdir(parents=True, exist_ok=True)
+TRANSFORM_DIR.mkdir(parents=True, exist_ok=True)
+
+CLEANUP_AFTER_SECONDS = 10 * 60
+
+
+def cleanup_old_files():
+    """Delete generated files after 10 minutes without activity."""
+    marker = DATA_ROOT / ".activity"
+
+    if marker.exists():
+        if time.time() - marker.stat().st_mtime < CLEANUP_AFTER_SECONDS:
+            return
+
+    for folder in (EXTRACT_DIR, TRANSFORM_DIR):
+        if folder.exists():
+            shutil.rmtree(folder, ignore_errors=True)
+            
+    marker.unlink(missing_ok=True)
+    DATA_ROOT.mkdir(parents=True, exist_ok=True)
+
+
+def touch_activity():
+    DATA_ROOT.mkdir(parents=True, exist_ok=True)
+    (DATA_ROOT / ".activity").touch()
 
 
 class ETLTools:
-
-    def __init__(self):
-        pass
-
     def extract_load(self, url: str, output_folder: str, format: str):
-        """
-        Extract API data and save it inside the current session folder.
-        """
         try:
-            supported_formats = {"csv", "json", "parquet"}
-            if format not in supported_formats:
+            cleanup_old_files()
+
+            fmt = format.lower().strip()
+
+            if fmt not in {"csv", "json", "parquet"}:
                 return f"Unsupported format: {format}"
-
-            # Keep outputs such as data/extract inside the session folder.
-            relative_folder = os.path.normpath(output_folder)
-
-            if relative_folder in (".", ""):
-                relative_folder = "extract"
-
-            filename = get_output_path(
-                os.path.join(relative_folder, f"extracted_data.{format}")
-            )
 
             response = requests.get(url, timeout=30)
             response.raise_for_status()
             data = response.json()
 
-            # Support APIs that return a list directly, as well as
-            # APIs that wrap records in a "results" property.
-            if isinstance(data, dict) and "results" in data:
-                records = data["results"]
-            elif isinstance(data, list):
+            records = None
+
+            if isinstance(data, list):
                 records = data
-            else:
-                records = data
+            elif isinstance(data, dict):
+                for key in (
+                    "products", "results", "data", "items", "records"
+                ):
+                    if isinstance(data.get(key), list):
+                        records = data[key]
+                        break
+
+                if records is None:
+                    records = [data]
+
+            if not records:
+                return "Extraction failed: API returned no records."
+
+            if not all(isinstance(row, dict) for row in records):
+                return "Extraction failed: Expected JSON objects as records."
 
             df = pd.json_normalize(records)
 
-            if format == "csv":
+            # Keep only the latest extracted dataset.
+            shutil.rmtree(EXTRACT_DIR, ignore_errors=True)
+            EXTRACT_DIR.mkdir(parents=True, exist_ok=True)
+
+            filename = EXTRACT_DIR / f"extracted_data.{fmt}"
+
+            if fmt == "csv":
                 df.to_csv(filename, index=False)
-            elif format == "json":
+            elif fmt == "json":
                 df.to_json(filename, orient="records", lines=True)
-            elif format == "parquet":
+            else:
                 df.to_parquet(filename, index=False)
 
-            return f"Data successfully extracted and saved to {filename}"
+            touch_activity()
+
+            return (
+                "Extraction successful.\n"
+                f"File: {filename}\n"
+                f"Rows extracted: {len(df)}\n"
+                f"Columns: {list(df.columns)}\n"
+                f"First 5 rows:\n{df.head(5).to_string(index=False)}"
+            )
 
         except requests.exceptions.RequestException as e:
-            return f"Failed to extract data: {e}"
+            return f"Extraction failed: {e}"
         except Exception as e:
-            return f"Failed to extract and save data: {e}"
+            return f"Extraction failed: {type(e).__name__}: {e}"
 
-    def transform_load_context(self, file_path: str):
-        """
-        Read an extracted file and return its first three rows.
-        """
+    def transform_load_context(self, file_path: str = ""):
+        """Read the latest extracted file and return a preview."""
         try:
-            path = os.path.abspath(file_path)
-            session_folder = get_session_folder().resolve()
+            cleanup_old_files()
 
-            # Only read files belonging to this session.
-            if (
-                path != str(session_folder)
-                and str(session_folder) not in os.path.commonpath(
-                    [str(session_folder), path]
-                )
-            ):
-                return "Error: File must be inside the current session folder."
+            candidates = [
+                path for path in EXTRACT_DIR.glob("extracted_data.*")
+                if path.suffix.lower() in {".csv", ".json", ".parquet"}
+            ]
 
-            if not os.path.isfile(path):
-                return f"File not found: {path}"
+            if not candidates:
+                return "No extracted file found. Extract data first."
 
-            file_extension = os.path.splitext(path)[1].lower()
+            path = candidates[0]
+            df = self._read_file(path)
+            touch_activity()
 
-            if file_extension == ".csv":
-                df = pd.read_csv(path)
-            elif file_extension == ".json":
-                df = pd.read_json(path, lines=True)
-            elif file_extension == ".parquet":
-                df = pd.read_parquet(path)
-            else:
-                return f"Unsupported file format: {file_extension}"
-
-            return str(df.head(3))
+            return (
+                f"Input file: {path}\n"
+                f"Rows: {len(df)}\n"
+                f"Columns: {list(df.columns)}\n"
+                f"Preview:\n{df.head(5).to_string(index=False)}"
+            )
 
         except Exception as e:
-            return f"Failed to read file: {e}"
+            return f"Failed to read extracted data: {type(e).__name__}: {e}"
+
+    @staticmethod
+    def _read_file(path: Path):
+        suffix = path.suffix.lower()
+
+        if suffix == ".csv":
+            return pd.read_csv(path)
+        if suffix == ".json":
+            return pd.read_json(path, lines=True)
+        if suffix == ".parquet":
+            return pd.read_parquet(path)
+
+        raise ValueError(f"Unsupported file format: {suffix}")
 
     def execute_code(self, code: str):
         """

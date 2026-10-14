@@ -1,21 +1,24 @@
 import os
 import sys
 import pandas as pd
+import shutil
 
-from utils.session_storage import (
-    get_output_path,
-    get_session_folder,
+sys.path.append(
+    os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 )
 
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
-
 from utils.llm_pick import pick_llm
-from utils.etl_tools import ETLTools
+from utils.etl_tools import (
+    ETLTools,
+    EXTRACT_DIR,
+    TRANSFORM_DIR,
+    touch_activity,
+    cleanup_old_files,
+)
 from models.schema import ETLAgentSchema
-from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
+from langchain_core.messages import ToolMessage
 from langgraph.graph import StateGraph, START, END
 from langchain.tools import tool
-from langchain_groq import ChatGroq
 
 
 #------------------------------------ AGENT TOOLS ------------------------------------#
@@ -41,8 +44,6 @@ def extract_load_tool(url:str, output_folder:str, format:str) -> str:
 
 
 
-
-
 @tool
 def transform_load_tool(
     input_file_path: str,
@@ -50,127 +51,70 @@ def transform_load_tool(
     output_format: str,
     user_question: str,
 ) -> str:
-    """Transform a file in the active session's temporary folder."""
+    """Transform the latest extracted dataset and save the result."""
     try:
-        session_folder = get_session_folder().resolve()
+        cleanup_old_files()
 
-        # 1. Locate the input file safely within the current session.
-        candidate = (input_file_path or "").strip().strip('"')
-        input_path = None
+        # Always use the latest extracted file.
+        candidates = [
+            path
+            for path in EXTRACT_DIR.glob("extracted_data.*")
+            if path.suffix.lower() in {".csv", ".json", ".parquet"}
+        ]
 
-        if candidate:
-            supplied_path = (
-                os.path.abspath(os.path.join(session_folder, candidate))
-                if not os.path.isabs(candidate)
-                else os.path.abspath(candidate)
-            )
+        if not candidates:
+            return "No extracted file found. Please extract data first."
 
-            real_path = os.path.realpath(supplied_path)
-            real_session = os.path.realpath(str(session_folder))
+        input_path = candidates[0]
+        df = ETLTools._read_file(input_path)
 
-            try:
-                inside_session = (
-                    os.path.commonpath([real_session, real_path])
-                    == real_session
-                )
-            except ValueError:
-                inside_session = False
-
-            if inside_session and os.path.isfile(real_path):
-                input_path = real_path
-
-        # Search both directory layouts used by the extraction tool.
-        if input_path is None:
-            search_dirs = [
-                session_folder / "extract",
-                session_folder / "data" / "extract",
-            ]
-
-            for directory in search_dirs:
-                preferred = directory / "extracted_data.csv"
-                if preferred.is_file():
-                    input_path = str(preferred.resolve())
-                    break
-
-            # Fall back to another CSV in either extraction folder.
-            if input_path is None:
-                for directory in search_dirs:
-                    if directory.is_dir():
-                        matches = sorted(directory.glob("*.csv"))
-                        if matches:
-                            input_path = str(matches[0].resolve())
-                            break
-
-        if input_path is None:
-            return (
-                "No extracted file was found in the current session. "
-                f"Session folder: {session_folder}. "
-                "Please extract the data in this chat first."
-            )
-
-        # 2. Load the source file.
-        extension = os.path.splitext(input_path)[1].lower()
-
-        if extension == ".csv":
-            df = pd.read_csv(input_path)
-        elif extension == ".json":
-            df = pd.read_json(input_path, lines=True)
-        elif extension == ".parquet":
-            df = pd.read_parquet(input_path)
-        else:
-            return f"Unsupported input format: {extension}"
-
-        # 3. Validate the output format.
+        # Validate output format.
         fmt = (output_format or "csv").lower().strip()
         if fmt not in {"csv", "json", "parquet"}:
             return f"Unsupported output format: {output_format}"
 
-        # 4. Apply deterministic transformations when recognized.
         question = (user_question or "").lower()
 
+        # Apply common product cleanup when requested.
         product_columns = [
             "id", "title", "category", "price", "rating", "stock"
         ]
 
         if (
-            all(col in df.columns for col in product_columns)
-            and all(col in question for col in product_columns)
+            all(column in df.columns for column in product_columns)
+            and all(column in question for column in product_columns)
         ):
             df = df[product_columns].copy()
             df = df.drop_duplicates(subset=["id"])
             df["title"] = df["title"].astype("string").str.strip()
             df = df[df["title"].notna() & df["title"].ne("")].copy()
 
-        elif "name" in question and "url" in question:
-            required = {"name", "url"}
-            missing = required - set(df.columns)
-
-            if missing:
-                return (
-                    f"Missing columns: {sorted(missing)}. "
-                    f"Available columns: {list(df.columns)}"
-                )
-
-            df = df[["name", "url"]].drop_duplicates()
-
         else:
-            # Keep the existing LLM-based transformation for other tasks.
+            # Use the LLM to generate transformations for other requests.
             llm = pick_llm("medium")
             prompt = f"""
-Transform the existing pandas DataFrame named df as requested.
-Return Python code only. Do not read or write files or import modules.
-Leave the final DataFrame in variable df.
+You are transforming an existing pandas DataFrame named df.
 
-Request: {user_question}
-Columns: {list(df.columns)}
-Preview:
-{df.head(3).to_string(index=False)}
+Return Python code only. Do not import modules, read files, or write files.
+Use only pandas operations available through pd.
+Leave the final DataFrame in the variable df.
+
+User request:
+{user_question}
+
+Available columns:
+{list(df.columns)}
+
+Data preview:
+{df.head(5).to_string(index=False)}
+
+If a requested column does not exist, leave df unchanged.
 """
             response = llm.invoke(prompt)
             pandas_code = response.content
 
             if not isinstance(pandas_code, str):
-                return "Error: The model did not return Python code."
+                return "Transformation failed: The model did not return code."
 
             pandas_code = pandas_code.strip()
 
@@ -193,17 +137,15 @@ Preview:
 
             if not isinstance(df, pd.DataFrame):
                 return (
-                    "Error: Transformation must leave a DataFrame "
+                    "Transformation failed: Expected a pandas DataFrame "
                     "named df."
                 )
 
-        # 5. Save output inside this session.
-        output_name = f"transformed_data.{fmt}"
-        relative_output_folder = (output_folder or "transform").strip()
+        # Replace the previous transformed output.
+        shutil.rmtree(TRANSFORM_DIR, ignore_errors=True)
+        TRANSFORM_DIR.mkdir(parents=True, exist_ok=True)
 
-        output_path = get_output_path(
-            os.path.join(relative_output_folder, output_name)
-        )
+        output_path = TRANSFORM_DIR / f"transformed_data.{fmt}"
 
         if fmt == "csv":
             df.to_csv(output_path, index=False)
@@ -212,8 +154,7 @@ Preview:
         else:
             df.to_parquet(output_path, index=False)
 
-        # 6. Return a preview and row count.
-        preview = df.head(5).to_string(index=False)
+        touch_activity()
 
         return (
             "Transformation completed successfully.\n"
@@ -221,7 +162,9 @@ Preview:
             f"Output file: {output_path}\n"
             f"Format: {fmt}\n"
             f"Total rows: {len(df)}\n"
-            f"Preview (first 5 rows):\n{preview}"
+            f"Columns: {list(df.columns)}\n"
+            f"Preview (first 5 rows):\n"
+            f"{df.head(5).to_string(index=False)}"
         )
 
     except Exception as e:

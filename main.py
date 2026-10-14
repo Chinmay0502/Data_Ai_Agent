@@ -2,7 +2,6 @@
 import asyncio
 import logging
 import os
-import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -16,22 +15,36 @@ from langchain_core.messages import HumanMessage
 load_dotenv()
 
 from agents.data_agent import data_agent
-from utils.session_storage import (
-    STORAGE_ROOT,
-    cleanup_loop,
-    current_session_id,
-    get_session_folder,
-    validate_session_id,
+from utils.etl_tools import (
+    DATA_ROOT,
+    EXTRACT_DIR,
+    TRANSFORM_DIR,
+    cleanup_old_files,
 )
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
+async def cleanup_loop():
+    """Check for expired temporary files once per minute."""
+    while True:
+        try:
+            cleanup_old_files()
+        except Exception:
+            logger.exception("Temporary-file cleanup failed")
+
+        await asyncio.sleep(60)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    STORAGE_ROOT.mkdir(parents=True, exist_ok=True)
+    DATA_ROOT.mkdir(parents=True, exist_ok=True)
+    EXTRACT_DIR.mkdir(parents=True, exist_ok=True)
+    TRANSFORM_DIR.mkdir(parents=True, exist_ok=True)
+
     cleanup_task = asyncio.create_task(cleanup_loop())
+
     try:
         yield
     finally:
@@ -63,12 +76,10 @@ app.add_middleware(
 
 class ChatRequest(BaseModel):
     question: str = Field(min_length=1, max_length=5000)
-    session_id: str | None = None
 
 
 class ChatResponse(BaseModel):
     answer: str
-    session_id: str
 
 
 def extract_answer(messages) -> str:
@@ -103,74 +114,80 @@ def health():
 
 @app.post("/chat", response_model=ChatResponse)
 async def chat(request: ChatRequest):
-    session_id = request.session_id or str(uuid.uuid4())
-
     try:
-        validate_session_id(session_id)
-        get_session_folder(session_id)
+        initial_state = {
+            "messages": [HumanMessage(content=request.question)],
+            "route_response": "",
+        }
 
-        token = current_session_id.set(session_id)
-        try:
-            initial_state = {
-                "messages": [HumanMessage(content=request.question)],
-                "route_response": "",
-            }
+        result = await data_agent.ainvoke(initial_state)
+        answer = extract_answer(result.get("messages", []))
 
-            result = await data_agent.ainvoke(initial_state)
-            answer = extract_answer(result.get("messages", []))
+        if not answer:
+            logger.warning("Agent returned no extractable answer")
+            answer = (
+                "The agent completed but returned no readable answer. "
+                "Please check the backend logs."
+            )
 
-            if not answer:
-                logger.warning("Agent returned no extractable answer")
-                answer = (
-                    "The agent completed but returned no readable answer. "
-                    "Please check the backend logs."
-                )
+        return ChatResponse(answer=answer)
 
-            return ChatResponse(answer=answer, session_id=session_id)
-        finally:
-            current_session_id.reset(token)
-
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
     except Exception:
         logger.exception("Ola Data Agent request failed")
         raise HTTPException(
             status_code=500,
-            detail="The agent could not process your request. Check backend logs.",
+            detail=(
+                "The agent could not process your request. "
+                "Check backend logs."
+            ),
         )
 
 
-@app.get("/files/{session_id}")
-def list_session_files(session_id: str):
-    try:
-        folder = get_session_folder(validate_session_id(session_id))
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-
+@app.get("/files")
+def list_files():
     files = []
-    for path in folder.rglob("*"):
-        if path.is_file() and path.name != ".activity":
-            files.append({
-                "name": path.name,
-                "path": path.relative_to(folder).as_posix(),
-                "download_url": f"/files/{session_id}/download/"
-                                f"{path.relative_to(folder).as_posix()}",
-            })
 
-    return {"session_id": session_id, "files": files}
+    for folder in (EXTRACT_DIR, TRANSFORM_DIR):
+        if not folder.exists():
+            continue
+
+        for path in folder.rglob("*"):
+            if path.is_file() and path.name != ".activity":
+                relative_path = path.relative_to(DATA_ROOT).as_posix()
+
+                files.append({
+                    "name": path.name,
+                    "path": relative_path,
+                    "download_url": f"/files/download/{relative_path}",
+                })
+
+    return {"files": files}
 
 
-@app.get("/files/{session_id}/download/{file_path:path}")
-def download_session_file(session_id: str, file_path: str):
-    try:
-        folder = get_session_folder(validate_session_id(session_id))
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
+@app.get("/files/download/{file_path:path}")
+def download_file(file_path: str):
+    requested = (DATA_ROOT / file_path).resolve()
+    root = DATA_ROOT.resolve()
 
-    requested = (folder / file_path).resolve()
+    if requested != root and root not in requested.parents:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid file path",
+        )
 
-    if folder.resolve() not in requested.parents:
-        raise HTTPException(status_code=400, detail="Invalid file path")
+    allowed_folders = {
+        EXTRACT_DIR.resolve(),
+        TRANSFORM_DIR.resolve(),
+    }
+
+    if not any(
+        requested == folder or folder in requested.parents
+        for folder in allowed_folders
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid file location",
+        )
 
     if not requested.is_file() or requested.name == ".activity":
         raise HTTPException(status_code=404, detail="File not found")

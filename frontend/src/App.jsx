@@ -42,10 +42,6 @@ const EXAMPLES = [
   },
 ];
 
-function createSessionId() {
-  return crypto.randomUUID();
-}
-
 function Icon({ children }) {
   return <span className="icon-mark" aria-hidden="true">{children}</span>;
 }
@@ -54,28 +50,26 @@ export default function App() {
   const [question, setQuestion] = useState("");
   const [messages, setMessages] = useState([]);
   const [loading, setLoading] = useState(false);
-  const [sessionId, setSessionId] = useState(createSessionId);
   const [files, setFiles] = useState([]);
   const [fileError, setFileError] = useState("");
   const [activeNav, setActiveNav] = useState("Home");
 
-  async function refreshFiles(activeSessionId = sessionId) {
-    try {
-      const response = await fetch(
-        `${API_URL}/files/${encodeURIComponent(activeSessionId)}`
-      );
+  
+async function refreshFiles() {
+  try {
+    const response = await fetch(`${API_URL}/files`);
 
-      if (!response.ok) {
-        throw new Error("Could not load session files.");
-      }
-
-      const data = await response.json();
-      setFiles(data.files || []);
-      setFileError("");
-    } catch (error) {
-      setFileError(error.message);
+    if (!response.ok) {
+      throw new Error("Could not load generated files.");
     }
+
+    const data = await response.json();
+    setFiles(data.files || []);
+    setFileError("");
+  } catch (error) {
+    setFileError(error.message);
   }
+}
 
   async function sendMessage(event) {
     event?.preventDefault();
@@ -96,7 +90,6 @@ export default function App() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           question: text,
-          session_id: sessionId,
         }),
       });
 
@@ -115,7 +108,7 @@ export default function App() {
         { role: "assistant", content: data.answer },
       ]);
 
-      await refreshFiles(sessionId);
+      await refreshFiles();
     } catch (error) {
       setMessages((previous) => [
         ...previous,
@@ -132,7 +125,6 @@ export default function App() {
   function startNewChat() {
     if (loading) return;
 
-    setSessionId(createSessionId());
     setMessages([]);
     setQuestion("");
     setFiles([]);
@@ -411,7 +403,7 @@ export default function App() {
               <h2>Talk to your data.</h2>
               <p>Ask a question, provide an API URL, or describe a transformation.</p>
             </div>
-            <div className="chat-session-tag">SESSION <span>{sessionId.slice(0, 8)}</span></div>
+            <div className="chat-session-tag">SHARED WORKSPACE</div>
           </div>
 
           <div className="messages-area">
@@ -498,8 +490,8 @@ export default function App() {
           <div className="section-heading">
             <div>
               <div className="overline">YOUR OUTPUTS</div>
-              <h2>Session files.</h2>
-              <p>Files generated in the current session can appear here.</p>
+              <h2>Generated files.</h2>
+              <p>Files created in the shared workspace appear here.</p>
             </div>
             <button className="button button-outline" onClick={() => refreshFiles()}>
               ↻ Refresh files
@@ -532,8 +524,8 @@ export default function App() {
             <div className="files-empty">
               <span>▧</span>
               <div>
-                <strong>No files in this session yet</strong>
-                <p>Run an ETL request and refresh this section to check for generated files.</p>
+                <strong>No generated files yet</strong>
+                <p>Run an ETL request, then refresh this section.</p>
               </div>
             </div>
           )}
