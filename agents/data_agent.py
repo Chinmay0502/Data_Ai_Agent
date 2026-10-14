@@ -13,7 +13,7 @@ from langchain.tools import tool
 from langchain_groq import ChatGroq
 from agents.etl_analyst import etl_analyst
 from agents.sql_analyst import sql_analyst
-
+from langgraph.checkpoint.memory import MemorySaver
 
 llm = pick_llm("medium")
 
@@ -120,7 +120,9 @@ data_agent_graph.add_conditional_edges("router_node", route_edge,
                                           "etl_node": "etl_node"
                                       })
 
-data_agent = data_agent_graph.compile()
+# data_agent = data_agent_graph.compile()
+checkpointer = MemorySaver()
+data_agent = data_agent_graph.compile(checkpointer=checkpointer)
 
 # # Optional|
 # from IPython.display import display, Image
