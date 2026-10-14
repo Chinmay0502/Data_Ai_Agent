@@ -11,6 +11,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 from langchain_core.messages import HumanMessage
+import uuid
 
 load_dotenv()
 
@@ -120,7 +121,9 @@ async def chat(request: ChatRequest):
             "route_response": "",
         }
 
-        result = await data_agent.ainvoke(initial_state)
+        result = await data_agent.ainvoke(initial_state, config={"configurable": {
+            "thread_id": str(uuid.uuid4())
+        }})
         answer = extract_answer(result.get("messages", []))
 
         if not answer:
